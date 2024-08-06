@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <iostream>
+#define CLAMP(x, low, high)  (((x) > (high)) ? (high) : (((x) < (low)) ? (low) : (x)))
 
 
 using namespace std;
@@ -26,6 +27,9 @@ enum ColorSpace
 void convertImage(CImg<unsigned char> image, ColorSpace bitsPerColor, string output_path, bool append, int fps, bool invert);
 void saveImage(CImg<unsigned char> image);
 void alterFps(string file, int fps);
+void ditherFS(CImg<unsigned char> &image);
+void ditherSierra(CImg<unsigned char> &image);
+
 
 bool has_suffix(const std::string &str, const std::string &suffix)
 {
@@ -42,12 +46,13 @@ int main(int argc, char *argv[]) {
     bool quiet = false;
     bool append = false;
     bool invert_1bit = false;
+    bool dither_1bit = true;
     enum ColorSpace bitsPerColor = rgb565;
 
 	
 	
     char c;
-    while ((c = getopt (argc, argv, "i:o:r:b:aqlx")) != -1)
+    while ((c = getopt (argc, argv, "i:o:r:b:aqlxn")) != -1)
     {
         switch (c)
         {
@@ -73,6 +78,9 @@ int main(int argc, char *argv[]) {
             case 'x':
                 invert_1bit = true;
                 break;
+            case 'n':
+                dither_1bit = false;
+                break;
             case '?':
                 if (optopt == 'i' || optopt == 'o' || optopt == 'r')
                     fprintf (stderr, "Option -%c requires an argument.\n", optopt);
@@ -94,7 +102,6 @@ int main(int argc, char *argv[]) {
 
     if(has_suffix(input_path, "lmi") && fps > 0)
     {
-
         alterFps(input_path, fps);
         printf("Framerate for %s changed to %i\n", input_path.c_str(), fps);
         return 0;
@@ -103,7 +110,7 @@ int main(int argc, char *argv[]) {
     if(!quiet)
         printf("Output: %s\n", output_path.c_str());
     
-    CImg<> input;
+    CImg<unsigned char> input;
     
 
     if(has_suffix(input_path, "jpg") || has_suffix(input_path, "jpeg") || has_suffix(input_path, "png"))
@@ -122,6 +129,18 @@ int main(int argc, char *argv[]) {
      
     if(!quiet)
         printf("Colorspace: %i\n", bitsPerColor );
+
+
+    if(bitsPerColor <= 1)
+    {
+        // Convert to grayscale
+        if (input.spectrum() == 3) 
+            input.RGBtoYCbCr().channel(0);
+                
+        if(dither_1bit)
+            ditherSierra(input);        
+    }
+
 
     convertImage(input, bitsPerColor, output_path, append, fps, invert_1bit);
 
@@ -158,8 +177,8 @@ void convertImage(CImg<unsigned char> image, ColorSpace bitsPerColor, string out
             uint8_t header[10] = {'L', 'M', 'I', (uint8_t)(bitsPerColor & 0xFF), 0x0A, (uint8_t)((image.width() >> 8) & 0xFF), (uint8_t)(image.width() & 0xFF), (uint8_t)((image.height() >> 8) & 0xFF), (uint8_t)(image.height() & 0xFF), (uint8_t)fps};    
             write(hFile, &header, sizeof(header));
         } else {
-            uint8_t header[9] = {'L', 'M', 'I', (uint8_t)(bitsPerColor & 0xFF), 0x09, (uint8_t)((image.width() >> 8) & 0xFF), (uint8_t)(image.width() & 0xFF), (uint8_t)((image.height() >> 8) & 0xFF), (uint8_t)(image.height() & 0xFF)};
-            write(hFile, &header, sizeof(header));
+            uint8_t header[9] = {'L', 'M', 'I', (uint8_t)(bitsPerColor & 0xFF), 0x09, (uint8_t)((image.width() >> 8) & 0xFF), (uint8_t)(image.width() & 0xFF), (uint8_t)((image.height() >> 8) & 0xFF), (uint8_t)(image.height() & 0xFF)};        
+            write(hFile, &header, sizeof(header));            
         }        
     }
 	
@@ -232,6 +251,7 @@ void convertImage(CImg<unsigned char> image, ColorSpace bitsPerColor, string out
                 uint8_t color332 = (red << 5) | (green << 2) | blue;
                 write(hFile, &color332, sizeof(color332));
             }
+
             else if(bitsPerColor == binary)
             {
                 unsigned char currentByte = 0x00;
@@ -298,4 +318,49 @@ void saveImage(CImg<unsigned char> image)
     }
 
     bitmap.save("output.png");
+}
+
+
+void ditherFS(CImg<unsigned char>& img) {
+    const int width = img.width();
+    const int height = img.height();
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            
+            unsigned char actualColor = img(x, y);
+            unsigned char matchedColor = (actualColor > 128) ? 255 : 0;
+            img(x, y) = matchedColor;
+
+            float error = (actualColor - matchedColor) / 16;
+
+            if (x + 1 < width) img(x + 1, y) = CLAMP(img(x + 1, y) + error * 7, 0, 255);
+            if (x - 1 >= 0 && y + 1 < height) img(x - 1, y + 1) = CLAMP(img(x-1,y+1) + error * 3, 0, 255);
+            if (y + 1 < height) img(x, y + 1) = CLAMP(img(x, y + 1) + error * 5, 0, 255);
+            if (x + 1 < width && y + 1 < height) img(x + 1, y + 1) = CLAMP(img(x + 1, y + 1) + error * 1, 0, 255);
+        }
+    }
+}
+
+void ditherSierra(CImg<unsigned char>& img) {
+    int width = img.width();
+    int height = img.height();
+
+    // Iterate over each pixel in the image
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int actualColor = img(x, y);
+            int matchedColor = actualColor < 128 ? 0 : 255;
+            img(x, y) = matchedColor;
+            float error = (actualColor - matchedColor) / 4;
+
+            if (x + 1 < width)
+                img(x + 1, y) = CLAMP(img(x + 1, y) + error * 2, 0, 255);
+            if (y + 1 < height) {
+                if (x - 1 >= 0)
+                    img(x - 1, y + 1) = CLAMP( img(x - 1, y + 1) + error * 1, 0, 255);
+                img(x, y + 1) = CLAMP(img(x, y + 1) + error * 1, 0, 255);
+            }
+        }
+    }
 }
