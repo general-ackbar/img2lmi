@@ -34,3 +34,6 @@ img2lmi
 *.map
 *.out
 
+.vscode/
+img2lmi
+
